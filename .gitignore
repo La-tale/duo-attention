@@ -183,3 +183,4 @@ my_snapshot*
 # SMS
 eval/LongBench/config
 torch_profile_example
+*debug_or_failed*
