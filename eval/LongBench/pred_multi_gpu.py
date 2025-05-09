@@ -54,8 +54,10 @@ def parse_args(args=None):
     parser.add_argument("--recent_size", type=int, default=None)
 
     parser.add_argument("--sparsity", type=float, default=0.5)
-
-    parser.add_argument("--decoding_simulation_length", type=int, default=50)
+    
+    ## SMS' COMMENTS ## . 2025-04-29
+    parser.add_argument("--decoding_simulation_length", type=int, default=0)
+    #  parser.add_argument("--decoding_simulation_length", type=int, default=50)
 
     return parser.parse_args(args)
 
@@ -164,9 +166,9 @@ def get_pred(
                 generated_content += [pred_token_idx.item()]
                 if pred_token_idx.item() in eos_token_ids:
                     break
-
         pred = tokenizer.decode(generated_content, skip_special_tokens=True)
         pred = post_process(pred, model_name)
+
         #  print(f"Prediction: {pred}")
         preds.append(
             {
@@ -306,9 +308,11 @@ if __name__ == "__main__":
         if not os.path.exists(f"eval/LongBench/pred/{model_name}"):
             os.makedirs(f"eval/LongBench/pred/{model_name}")
         if args.method == "duo_attn":
-            out_path = f"eval/LongBench/pred/{model_name}/{dataset}-duo_attn-pattern-{args.attn_load_dir.split('/')[-1]}-sp-{args.sparsity}.jsonl"
+            ## SMS' COMMENTS ## . 2025-04-29
+            out_path = f"eval/LongBench/pred/{model_name}_rebuttal/{dataset}-duo_attn-pattern-{args.attn_load_dir.split('/')[-1]}-sp-{args.sparsity}_no_decode_sim.jsonl"
         else:
-            out_path = f"eval/LongBench/pred/{model_name}/{dataset}-full.jsonl"
+            ## SMS' COMMENTS ## . 2025-04-25
+            out_path = f"eval/LongBench/pred/{model_name}_rebuttal/{dataset}-full_no_decode_sim.jsonl"
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]
         preds = get_pred(

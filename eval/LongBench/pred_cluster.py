@@ -20,14 +20,12 @@ from duo_attn.utils import (
     sparsify_attention_heads,
 )
 from duo_attn.patch.tuple_kv_cache import enable_tuple_kv_cache
+## SMS' COMMENTS ## . 2025-03-17
+from sms_workspace.patch.llama_clustering_acc import enable_clustering
 
-# CUDA_VISIBLE_DEVICES íê²½ ë³ìë¥¼ íì¸
-cuda_devices = os.getenv("CUDA_VISIBLE_DEVICES", "")
-if cuda_devices:
-    devices = cuda_devices.split(',')
-    if len(devices) > 1:
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = "expandable_segments:True"
-
+## Clustering works abnormally when turn off below two opttions ##
+os.environ['TORCH_USE_CUDA_DSA']='1'
+os.environ['CUDA_LAUNCH_BLOCKING']='1'
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -56,6 +54,10 @@ def parse_args(args=None):
     parser.add_argument("--sparsity", type=float, default=0.5)
 
     parser.add_argument("--decoding_simulation_length", type=int, default=50)
+    
+    ## SMS' COMMENTS ## . 2025-03-17
+    parser.add_argument('--cluster_args_path', type=str, default=None, help="Path to the cluster args")
+    parser.add_argument("--budget", type=float, default=1.0)
 
     return parser.parse_args(args)
 
@@ -125,10 +127,7 @@ def get_pred(
         ]:  # chat models are better off without build prompts on these tasks
             prompt = build_chat(tokenizer, prompt, model_name)
 
-        ## SMS' COMMENTS ## . 2025-03-17
-        #  input = tokenizer(prompt, truncation=False, return_tensors="pt").to("cuda")
-        device = model.device
-        input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+        input = tokenizer(prompt, truncation=False, return_tensors="pt").to("cuda")
         pbar.set_description(
             f"Generating for {idx}, len = {input.input_ids.shape[-1]}"
         )
@@ -193,29 +192,15 @@ def load_model_and_tokenizer(path, model_name):
     tokenizer = AutoTokenizer.from_pretrained(
         path, trust_remote_code=True, use_fast=False
     )
-    
-    ## SMS' COMMENTS ## . 2025-03-17
-    attn_impl = "flash_attention_2"
-    if args.method == "duo_attn":
-        attn_impl = "eager"
-
-        model = AutoModelForCausalLM.from_pretrained(
-            path,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            ## SMS' COMMENTS ## . 2025-03-17
-            attn_implementation=attn_impl,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            path,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            ## SMS' COMMENTS ## . 2025-03-17
-            attn_implementation=attn_impl,
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        attn_implementation="flash_attention_2",
+        use_cache=True,
+        device_map="auto"
+    )
 
     generation_config = GenerationConfig.from_pretrained(path)
     eos_token_ids = generation_config.eos_token_id
@@ -249,6 +234,15 @@ def load_model_and_tokenizer(path, model_name):
             sink_size,
             recent_size,
         )
+    ## SMS' COMMENTS ## . 2025-03-17
+    elif args.method == "cluster":
+        assert args.cluster_args_path is not None, "cluster_args_path must be provided"
+        print(
+            f"Loading clustering configuration from {args.cluster_args_path}"
+        )
+        cluster_args = json.load(open(args.cluster_args_path, "r"))
+
+        enable_clustering(model, **cluster_args) 
     else:
         enable_tuple_kv_cache(model)
 
@@ -266,13 +260,8 @@ if __name__ == "__main__":
     model, tokenizer, eos_token_ids = load_model_and_tokenizer(
         model2path[model_name], model_name
     )
-    ## SMS' COMMENTS ## . 2025-03-17
     if args.method == "duo_attn":
-        ## Flash attention isn't supported by enable_tp ##
         model = to_device(model, device_list, enable_tp=True)
-    else:
-        model = to_device(model, device_list, enable_pp=True)
-
 
     max_length = model2maxlen[model_name]
     if args.e:
@@ -307,6 +296,8 @@ if __name__ == "__main__":
             os.makedirs(f"eval/LongBench/pred/{model_name}")
         if args.method == "duo_attn":
             out_path = f"eval/LongBench/pred/{model_name}/{dataset}-duo_attn-pattern-{args.attn_load_dir.split('/')[-1]}-sp-{args.sparsity}.jsonl"
+        elif args.method == "cluster":
+            out_path = f"eval/LongBench/pred/{model_name}/{dataset}-cluster-budget-{args.budget}-torchpq.jsonl"
         else:
             out_path = f"eval/LongBench/pred/{model_name}/{dataset}-full.jsonl"
         prompt_format = dataset2prompt[dataset]
