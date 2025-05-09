@@ -179,3 +179,6 @@ cython_debug/
 
 *.code-workspace
 my_snapshot*
+
+# SMS
+eval/LongBench/config
