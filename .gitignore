@@ -182,3 +182,4 @@ my_snapshot*
 
 # SMS
 eval/LongBench/config
+torch_profile_example

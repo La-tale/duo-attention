@@ -30,6 +30,10 @@ from .static_kv_cache import (
     DuoAttentionStaticKVCache,
     enable_duo_attention_static_kv_cache_for_llama,
 )
+## SMS' COMMENTS ## . 2025-04-30
+from .offloaded_kv_cache import (
+    OffloadedDuoAttentionStaticKVCache
+)
 from .tuple_kv_cache import enable_tuple_kv_cache_for_llama
 from .flashinfer_utils import apply_rope_inplace, enable_flashinfer_rmsnorm
 
@@ -183,6 +187,7 @@ def llama_duo_attention_forward_one_way_reordered(
         unsqueeze_dim=2,  # unsqueeze_dim=2 for the flash attention
     )
 
+
     if not hasattr(self, "full_attn_head_mask") or self.full_attn_head_mask is None:
         self.full_attn_head_mask = self.full_attention_heads > 0.5
         self.num_full_attn_head = self.full_attn_head_mask.sum().item()
@@ -268,6 +273,12 @@ def llama_duo_attention_forward_one_way_reordered(
 
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
+    # 경과 시간 계산 및 저장
+    #  elapsed_time_ms = start_event.elapsed_time(end_event)
+    #  timing_dict[kv_seq_len] = elapsed_time_ms
+    #  print(f"kv_seq_len={kv_seq_len}, Execution time: {elapsed_time_ms} ms")
+
+
     attn_output = self.o_proj(attn_output)
 
     if streaming_key_states.shape[1] > self.recent_size + self.sink_size:
@@ -304,6 +315,139 @@ def llama_duo_attention_forward_one_way_reordered(
         attn_weights = None
 
     return attn_output, attn_weights, past_key_value
+
+## SMS' COMMENTS ## . 2025-04-30
+def llama_duo_attention_forward_one_way_reordered_offloaded(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    kv_cache: Optional[DuoAttentionStaticKVCache] = None,
+    layer_idx: int = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    **kwargs,
+):
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+    value_states = value_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    )
+
+    kv_seq_len = q_len
+    if kv_cache is not None:
+        kv_seq_len += kv_cache.kv_seq_len
+
+    # Replace the Huggingface's apply rotory pos emb with FlashInfer's rope
+
+    # cos, sin = self.rotary_emb(value_states, position_ids)
+    # query_states, key_states = apply_rotary_pos_emb(
+    #     query_states,
+    #     key_states,
+    #     cos,
+    #     sin,
+    #     unsqueeze_dim=2,  # unsqueeze_dim=2 for the flash attention
+    # )
+
+    rope_scale = 1.0
+    if self.config.rope_scaling is not None:
+        rope_scale = self.config.rope_scaling.get("factor", 1.0)
+    apply_rope_inplace(
+        query_states, key_states, position_ids[:, 0], rope_scale, self.rope_theta
+    )
+
+    (
+        full_key_states,
+        full_value_states,
+        streaming_key_states,
+        streaming_value_states,
+    ) = kv_cache.split_kv(layer_idx, key_states, value_states)
+    ## SMS' COMMENTS ## . 2025-04-30
+    #  full_key_states, full_value_states = kv_cache.put_full_kv(
+    #      layer_idx, full_key_states, full_value_states
+    #  )
+    full_key_states, full_value_states = kv_cache.update_full_kv(
+        layer_idx, full_key_states, full_value_states
+    )
+
+    if q_len == kv_seq_len:
+        # Initial pre-filling
+        attn_output = flash_attn_func(
+            query_states,
+            key_states,
+            value_states,
+            causal=True,
+            dropout_p=0.0,
+        )
+
+    else:
+        # Decoding or continous filling
+        num_full_query_head = (
+            kv_cache.num_full_kv_head_list[layer_idx] * self.num_key_value_groups
+        )
+
+        #  (
+        #      cached_streaming_key_states,
+        #      cached_streaming_value_states,
+        #  ) = kv_cache.get_streaming_kv(layer_idx)
+        #
+        #  streaming_key_states = torch.cat(
+        #      [cached_streaming_key_states, streaming_key_states], dim=1
+        #  )
+        #  streaming_value_states = torch.cat(
+        #      [cached_streaming_value_states, streaming_value_states], dim=1
+        #  )
+        streaming_key_states, streaming_value_states = kv_cache.update_streaming_kv(layer_idx, streaming_key_states, streaming_value_states)
+
+        if num_full_query_head > 0:
+            full_query_states = query_states[:, :, :num_full_query_head, :]
+            full_attn_output = flash_attn_func(
+                full_query_states,
+                full_key_states,
+                full_value_states,
+                causal=True,
+                dropout_p=0.0,
+            )
+        else:
+            full_attn_output = None
+
+        if self.num_heads - num_full_query_head > 0:
+            streaming_query_states = query_states[:, :, num_full_query_head:, :]
+            streaming_attn_output = flash_attn_func(
+                streaming_query_states,
+                streaming_key_states,
+                streaming_value_states,
+                causal=True,
+                dropout_p=0.0,
+            )
+        else:
+            streaming_attn_output = None
+
+        if full_attn_output is None:
+            attn_output = streaming_attn_output
+        elif streaming_attn_output is None:
+            attn_output = full_attn_output
+        else:
+            attn_output = torch.cat([full_attn_output, streaming_attn_output], dim=2)
+
+    #  kv_cache.compress_and_replace_streaming_kv(
+    #      layer_idx, streaming_key_states, streaming_value_states
+    #  )
+
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+    attn_output = self.o_proj(attn_output)
+
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights
 
 
 def llama_duo_attention_forward_one_way_reordered_static(
@@ -597,6 +741,50 @@ def enable_llama_duo_attention_static_kv_cache_eval(
             "in",
         )
 
+## SMS' COMMENTS ## . 2025-04-30
+def enable_llama_duo_attention_offloaded_kv_cache_eval(
+    model: LlamaForCausalLM,
+    full_attention_heads,
+):
+    enable_duo_attention_static_kv_cache_for_llama(model)
+    enable_flashinfer_rmsnorm(model)
+
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    for idx, layer in enumerate(model.model.layers):
+        module = layer.self_attn
+        layer_full_attention_heads = torch.tensor(
+            full_attention_heads[idx], device=device, dtype=dtype
+        )
+        
+        ## SMS' COMMENTS ## . 2025-04-30
+        module.forward = types.MethodType(
+            llama_duo_attention_forward_one_way_reordered_offloaded, module
+        )
+        module.q_proj = reorder_linear_weights(
+            module.q_proj,
+            layer_full_attention_heads,
+            module.num_key_value_groups * module.head_dim,
+            "out",
+        )
+        module.k_proj = reorder_linear_weights(
+            module.k_proj,
+            layer_full_attention_heads,
+            module.head_dim,
+            "out",
+        )
+        module.v_proj = reorder_linear_weights(
+            module.v_proj,
+            layer_full_attention_heads,
+            module.head_dim,
+            "out",
+        )
+        module.o_proj = reorder_linear_weights(
+            module.o_proj,
+            layer_full_attention_heads,
+            module.num_key_value_groups * module.head_dim,
+            "in",
+        )
 
 def get_llama_full_attention_heads(model):
     full_attention_heads = []
