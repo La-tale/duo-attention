@@ -184,3 +184,7 @@ my_snapshot*
 eval/LongBench/config
 torch_profile_example
 *debug_or_failed*
+nvtx_profile_example
+eval/LongBench/pred
+sms_outputs
+sms_profile
